@@ -20,7 +20,7 @@ declare -a APP_URLS=(
 )
 
 declare -a AIR_URLS=(
-    "https://airsdk.harman.com/assets/downloads/${AIR_VERSION}/AdobeAIR.dmg"
+    "https://airsdk.wxlift.com/assets/downloads/${AIR_VERSION}/AdobeAIR.dmg"
 )
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
