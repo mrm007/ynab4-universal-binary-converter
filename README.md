@@ -49,7 +49,10 @@ The updated workflow:
 4. Patches AIR 51's universal launcher back into captive-runtime mode
 5. Restores the missing `A2712Enabler` helper as a no-op compatibility shim
 6. Patches AIR 51's obsolete privileged helper-install code path so launching no longer prompts for an admin password
-7. Rebuilds the two legacy native extensions as small universal Objective-C shims
+7. Rebuilds the two legacy native extensions as small universal Objective-C shims. The `macutils` shim also works around AIR's menu and window handling on modern macOS:
+   - Makes the main window full-screen capable, as the original extension did, and gives the green title-bar button its native action back (click for full screen, Option-click to zoom) instead of AIR's maximize-only handler
+   - Stops plain key presses from reaching menu shortcuts, so typing `f` no longer matches macOS's Globe-F "Enter Full Screen" item
+   - Keeps the class of AppKit's own Window-menu items so "Move to <display>" is not added again every time the menu opens
 8. Ad-hoc signs the rebuilt app to avoid stale nested signatures
 
 ## Limitations

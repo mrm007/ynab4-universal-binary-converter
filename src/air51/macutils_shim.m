@@ -1,6 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <unistd.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 #import "FlashRuntimeExtensions.h"
 
@@ -201,12 +203,156 @@ static FREObject CheckAppStoreReceipt(FREContext ctx, void *functionData, uint32
     return fre_bool(hasReceipt);
 }
 
+// AIR replaces the green title-bar button's action with its own _playerZoom:, which YNAB receives as
+// "maximize", so the button never enters full screen. AIR keeps AppKit's original action in the
+// window's _cachedZoomAction ivar; putting it back restores the native behavior (click for full
+// screen, Option-click to zoom).
+static void restore_native_zoom_button(NSWindow *window) {
+    Ivar cachedZoomAction = class_getInstanceVariable(object_getClass(window), "_cachedZoomAction");
+    NSButton *zoomButton = [window standardWindowButton:NSWindowZoomButton];
+    if (cachedZoomAction == NULL || zoomButton == nil || zoomButton.action != sel_registerName("_playerZoom:")) {
+        return;
+    }
+    SEL nativeAction = *(SEL *)((uint8_t *)(__bridge void *)window + ivar_getOffset(cachedZoomAction));
+    if (nativeAction != NULL) {
+        zoomButton.action = nativeAction;
+    }
+}
+
 static FREObject EnableFullScreenMode(FREContext ctx, void *functionData, uint32_t argc, FREObject argv[]) {
     (void)ctx;
     (void)functionData;
     (void)argc;
     (void)argv;
-    return fre_bool(YES);
+
+    // Match the original extension: make YNAB's main window full-screen capable. AIR 51 also keeps
+    // its borderless splash window in NSApp.windows, so select titled, resizable windows only.
+    BOOL enabled = NO;
+    for (NSWindow *window in NSApp.windows) {
+        NSWindowStyleMask styleMask = window.styleMask;
+        if ((styleMask & NSWindowStyleMaskTitled) && (styleMask & NSWindowStyleMaskResizable)) {
+            window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+            restore_native_zoom_button(window);
+            enabled = YES;
+        }
+    }
+    return fre_bool(enabled);
+}
+
+static BOOL (*original_menu_performKeyEquivalent)(id, SEL, NSEvent *);
+
+// AIR offers every key press to the main menu, and AppKit treats the Globe modifier of its own
+// "Enter Full Screen" (Globe-F) item as optional, so a plain F toggles full screen and never reaches
+// YNAB. Every YNAB shortcut uses Command, so key presses without a shortcut modifier skip the menu.
+static BOOL menu_performKeyEquivalent(id menu, SEL selector, NSEvent *event) {
+    const NSEventModifierFlags shortcutModifiers = NSEventModifierFlagCommand | NSEventModifierFlagControl |
+                                                   NSEventModifierFlagOption | NSEventModifierFlagFunction;
+    if (event.type == NSEventTypeKeyDown && (event.modifierFlags & shortcutModifiers) == 0) {
+        return NO;
+    }
+    return original_menu_performKeyEquivalent(menu, selector, event);
+}
+
+static void install_menu_key_filter(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Method method = class_getInstanceMethod([NSMenu class], @selector(performKeyEquivalent:));
+        original_menu_performKeyEquivalent =
+            (BOOL (*)(id, SEL, NSEvent *))method_setImplementation(method, (IMP)menu_performKeyEquivalent);
+    });
+}
+
+static void (*original_air_menu_insertItem)(id, SEL, NSMenuItem *, NSInteger);
+static void (*appkit_menu_insertItem)(id, SEL, NSMenuItem *, NSInteger);
+static Class air_menu_item_class;
+static SEL platform_menu_item_selector;
+static SEL set_platform_menu_item_selector;
+static SEL dispatch_select_event_selector;
+static SEL ivar_map_table_selector;
+static char air_item_cleanup_key;
+
+// AIR keeps each menu item's platform state in a table keyed by the item pointer, and its own item
+// class removes the entry in -dealloc. This object does the same for an AppKit item when it is freed,
+// so a new object at the same address never inherits a stale entry.
+@interface YNABAIRMenuItemCleanup : NSObject
+- (instancetype)initWithItem:(NSMenuItem *)item;
+@end
+
+@implementation YNABAIRMenuItemCleanup {
+    const void *_item;
+}
+
+- (instancetype)initWithItem:(NSMenuItem *)item {
+    if ((self = [super init])) {
+        _item = (__bridge const void *)item;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    NSMapTable *table = ((NSMapTable * (*)(id, SEL))objc_msgSend)(air_menu_item_class, ivar_map_table_selector);
+    NSMapRemove(table, _item);
+}
+
+@end
+
+// AIR calls its item methods on every item it walks, so an item class that keeps its AppKit identity
+// still needs them. AIR's implementations only touch the table above via [[self class] ivarMapTable].
+static void add_air_item_methods(Class itemClass) {
+    Class airMeta = object_getClass(air_menu_item_class);
+    SEL instanceSelectors[] = {platform_menu_item_selector, set_platform_menu_item_selector, dispatch_select_event_selector};
+    for (size_t i = 0; i < sizeof(instanceSelectors) / sizeof(instanceSelectors[0]); i++) {
+        Method method = class_getInstanceMethod(air_menu_item_class, instanceSelectors[i]);
+        class_addMethod(itemClass, instanceSelectors[i], method_getImplementation(method), method_getTypeEncoding(method));
+    }
+    Method tableMethod = class_getInstanceMethod(airMeta, ivar_map_table_selector);
+    class_addMethod(object_getClass(itemClass), ivar_map_table_selector, method_getImplementation(tableMethod),
+                    method_getTypeEncoding(tableMethod));
+}
+
+// AIR's NSMenu subclass rewrites the class of every item inserted into its menus to its own item
+// class. AppKit recognizes the private NSMenuItem subclasses it adds to the Window menu (for example
+// NSWindowSidecarMenuItem, "Move to <display>") by class, so after the rewrite it never removes the
+// old ones and adds another copy each time the menu opens. Outside the menu bar itself, AIR's
+// override does nothing else, so insert AppKit's item subclasses there with their class intact.
+static void air_menu_insertItem(id menu, SEL selector, NSMenuItem *item, NSInteger index) {
+    Class itemClass = [item class];
+    if (menu != NSApp.mainMenu && itemClass != [NSMenuItem class] && ![itemClass isSubclassOfClass:air_menu_item_class]) {
+        add_air_item_methods(itemClass);
+        if (objc_getAssociatedObject(item, &air_item_cleanup_key) == nil) {
+            objc_setAssociatedObject(item, &air_item_cleanup_key, [[YNABAIRMenuItemCleanup alloc] initWithItem:item],
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        appkit_menu_insertItem(menu, selector, item, index);
+        return;
+    }
+    original_air_menu_insertItem(menu, selector, item, index);
+}
+
+static void install_air_menu_insert_fix(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class airMenuClass = objc_getClass("AIR_PlayerContentMenu");
+        air_menu_item_class = objc_getClass("AIR_PlayerContentMenuItem");
+        platform_menu_item_selector = sel_registerName("platformMenuItem");
+        set_platform_menu_item_selector = sel_registerName("setPlatformMenuItem:");
+        dispatch_select_event_selector = sel_registerName("dispatchSelectEvent");
+        ivar_map_table_selector = sel_registerName("ivarMapTable");
+        SEL selector = @selector(insertItem:atIndex:);
+        Method airInsert = airMenuClass ? class_getInstanceMethod(airMenuClass, selector) : NULL;
+        Method appkitInsert = class_getInstanceMethod([NSMenu class], selector);
+        // Only patch the AIR build this shim was written against.
+        if (airInsert == NULL || air_menu_item_class == Nil || airInsert == appkitInsert ||
+            !class_getInstanceMethod(air_menu_item_class, platform_menu_item_selector) ||
+            !class_getInstanceMethod(air_menu_item_class, set_platform_menu_item_selector) ||
+            !class_getInstanceMethod(air_menu_item_class, dispatch_select_event_selector) ||
+            !class_getClassMethod(air_menu_item_class, ivar_map_table_selector)) {
+            return;
+        }
+        appkit_menu_insertItem = (void (*)(id, SEL, NSMenuItem *, NSInteger))method_getImplementation(appkitInsert);
+        original_air_menu_insertItem =
+            (void (*)(id, SEL, NSMenuItem *, NSInteger))method_setImplementation(airInsert, (IMP)air_menu_insertItem);
+    });
 }
 
 static void MacUtilsContextFinalizer(FREContext ctx) {
@@ -239,6 +385,8 @@ void NativeExtensionsInitializer(void **extDataToSet, FREContextInitializer *ctx
     *extDataToSet = NULL;
     *ctxInitializerToSet = &MacUtilsContextInitializer;
     *ctxFinalizerToSet = &MacUtilsContextFinalizer;
+    install_menu_key_filter();
+    install_air_menu_insert_fix();
 }
 
 void NativeExtensionsFinalizer(void *extData) {
